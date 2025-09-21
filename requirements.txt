@@ -1,3 +1,4 @@
+--upgrade pip
 threading
 time
 collections
@@ -22,3 +23,4 @@ sklearn.ensemble
 sklearn.model_selectionlit
 sklearn.metrics
 plyer
+
