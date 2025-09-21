@@ -1,47 +1,45 @@
 #!/usr/bin/env python3
 """
-study_timer.py - Single-file MVP for a local Personalized Study Timer
+study_timer.py - Personalized Study Timer (Local MVP)
 
 Features:
 - Webcam feature extraction (Mediapipe FaceMesh -> EAR, face presence)
 - Keyboard & mouse capture (pynput)
-- Windowed aggregation (configurable window length & step)
-- Heuristic "Focused"/"Distracted" classifier by default
-- Option to collect labeled windows and train a RandomForest locally
-- Streamlit UI: live status, timer, charts, label buttons, train button
-- Local-only: no raw frames or raw keystrokes are saved. Only aggregated features are persisted.
+- Sliding window aggregation
+- Heuristic + optional RandomForest classifier
+- Streamlit UI: status, timer, charts, labeling, training
+- Local-only: no raw frames stored
 
 Setup:
-pip install streamlit opencv-python mediapipe pynput scikit-learn joblib pandas plyer
+    pip install streamlit opencv-python mediapipe pynput scikit-learn joblib pandas plyer
 
 Run:
-streamlit run study_timer.py
+    streamlit run study_timer.py
 
-Notes:
-- On some OSes, pynput may require accessibility permissions for global keyboard/mouse capture.
-- If you don't want global input capture, stop the listeners by toggling the checkbox in UI.
+Linux note:
+    If you see "ImportError: libGL.so.1: cannot open shared object file",
+    install OpenCV’s system dependency:
+        sudo apt-get update && sudo apt-get install -y libgl1
 """
 
-import threading
-import time
-import collections
-import math
 import os
-import csv
-import queue
-import json
-from datetime import datetime
-from pathlib import Path
-
 import cv2
-import mediapipe as mp
+import csv
+import time
+import math
+import json
+import queue
+import joblib
+import threading
+import collections
 import numpy as np
 import pandas as pd
-import joblib
-
-from pynput import keyboard, mouse
+import mediapipe as mp
 import streamlit as st
 
+from pathlib import Path
+from datetime import datetime
+from pynput import keyboard, mouse
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
@@ -54,23 +52,21 @@ except Exception:
     PLYER_AVAILABLE = False
 
 # -----------------------------
-# Configuration / constants
+# Configuration
 # -----------------------------
-WINDOW_SECONDS = 5  # length of aggregation window
-STEP_SECONDS = 1    # sliding step
-FPS_TARGET = 10     # approximate frame capture fps
-EAR_BLINK_THRESHOLD = 0.18  # eyeblink threshold (tune per-user)
+WINDOW_SECONDS = 5
+STEP_SECONDS = 1
+FPS_TARGET = 10
+EAR_BLINK_THRESHOLD = 0.18
 MODEL_PATH = "rf_focus_detector.joblib"
 LABEL_CSV = "labeled_windows.csv"
 
-# Mediapipe indices for eyes (from Face Mesh)
 LEFT_EYE_IDX = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE_IDX = [362, 385, 387, 263, 373, 380]
 
 # -----------------------------
-# Utility / feature functions
+# Utility
 # -----------------------------
-
 def hypot(a, b):
     return math.hypot(a, b)
 
@@ -87,7 +83,7 @@ def eye_aspect_ratio(landmarks, idxs, image_w, image_h):
         return 0.0
 
 # -----------------------------
-# Webcam capture thread
+# Webcam Capture
 # -----------------------------
 class WebcamCapture(threading.Thread):
     def __init__(self, frame_queue, stop_event, fps=FPS_TARGET):
@@ -95,9 +91,10 @@ class WebcamCapture(threading.Thread):
         self.frame_queue = frame_queue
         self.stop_event = stop_event
         self.fps = fps
-        self.mp_face = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face.FaceMesh(static_image_mode=False, max_num_faces=1,
-                                               refine_landmarks=True, min_detection_confidence=0.5)
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False, max_num_faces=1,
+            refine_landmarks=True, min_detection_confidence=0.5
+        )
         self.cap = None
 
     def run(self):
@@ -112,11 +109,9 @@ class WebcamCapture(threading.Thread):
                 time.sleep(wait)
                 continue
             ts = time.time()
-            # push (frame, ts) into queue but don't store many frames
             try:
                 self.frame_queue.put_nowait((frame.copy(), ts))
             except queue.Full:
-                # drop oldest frame to maintain throughput
                 try:
                     _ = self.frame_queue.get_nowait()
                     self.frame_queue.put_nowait((frame.copy(), ts))
@@ -126,14 +121,12 @@ class WebcamCapture(threading.Thread):
         self.cap.release()
 
 # -----------------------------
-# Activity tracker for keyboard/mouse
+# Keyboard/Mouse Tracker
 # -----------------------------
 class ActivityTracker:
     def __init__(self):
         self.lock = threading.Lock()
-        self.keystrokes = []
-        self.mouse_moves = []
-        self.clicks = []
+        self.keystrokes, self.mouse_moves, self.clicks = [], [], []
         self.last_event_time = time.time()
         self._k_listener = None
         self._m_listener = None
@@ -158,7 +151,7 @@ class ActivityTracker:
     def start(self):
         if self.listeners_running:
             return
-        self._k_listener = keyboard.Listener(on_press=lambda k: self._on_key(k))
+        self._k_listener = keyboard.Listener(on_press=self._on_key)
         self._m_listener = mouse.Listener(on_move=self._on_move, on_click=self._on_click)
         self._k_listener.start()
         self._m_listener.start()
@@ -179,18 +172,17 @@ class ActivityTracker:
         with self.lock:
             k = [t for t in self.keystrokes if t >= cutoff]
             c = [t for t in self.clicks if t >= cutoff]
-            m = [t for t, x, y in self.mouse_moves if t >= cutoff]
+            m = [t for t, _, _ in self.mouse_moves if t >= cutoff]
             idle = time.time() - self.last_event_time
-        features = {
+        return {
             "keystrokes": len(k),
             "clicks": len(c),
             "mouse_moves": len(m),
-            "idle_seconds": idle
+            "idle_seconds": idle,
         }
-        return features
 
 # -----------------------------
-# Window aggregator & feature extractor
+# Window Aggregator
 # -----------------------------
 class WindowAggregator(threading.Thread):
     def __init__(self, frame_queue, activity_tracker, output_queue, stop_event,
@@ -204,16 +196,14 @@ class WindowAggregator(threading.Thread):
         self.step_seconds = step_seconds
         self.buffer = collections.deque()
         self.last_emit = 0
-        self.mp_face = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face.FaceMesh(static_image_mode=False, max_num_faces=1,
-                                               refine_landmarks=True, min_detection_confidence=0.5)
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False, max_num_faces=1,
+            refine_landmarks=True, min_detection_confidence=0.5
+        )
 
     def extract_window_features(self, frames):
-        # frames: list of (image, ts)
-        ear_vals = []
-        face_presence = 0
-        yaw_vals = []
-        blink_count_est = 0
+        ear_vals, yaw_vals = [], []
+        face_presence, blink_count_est = 0, 0
         prev_ear = None
         for img, ts in frames:
             h, w = img.shape[:2]
@@ -222,17 +212,13 @@ class WindowAggregator(threading.Thread):
             if results.multi_face_landmarks:
                 face_presence += 1
                 lm = results.multi_face_landmarks[0].landmark
-                ear_l = eye_aspect_ratio(lm, LEFT_EYE_IDX, w, h)
-                ear_r = eye_aspect_ratio(lm, RIGHT_EYE_IDX, w, h)
-                ear = (ear_l + ear_r) / 2.0
+                ear = (eye_aspect_ratio(lm, LEFT_EYE_IDX, w, h) +
+                       eye_aspect_ratio(lm, RIGHT_EYE_IDX, w, h)) / 2.0
                 ear_vals.append(ear)
-                # blink estimation simple: count ear drops below threshold after being above
-                if prev_ear is not None:
-                    if prev_ear > EAR_BLINK_THRESHOLD and ear <= EAR_BLINK_THRESHOLD:
-                        blink_count_est += 1
+                if prev_ear is not None and prev_ear > EAR_BLINK_THRESHOLD and ear <= EAR_BLINK_THRESHOLD:
+                    blink_count_est += 1
                 prev_ear = ear
-                # placeholder yaw: not implemented robustly here (0.0)
-                yaw_vals.append(0.0)
+                yaw_vals.append(0.0)  # placeholder
             else:
                 ear_vals.append(0.0)
         feats = {
@@ -240,24 +226,19 @@ class WindowAggregator(threading.Thread):
             "ear_std": float(np.std(ear_vals)) if ear_vals else 0.0,
             "face_presence": float(face_presence / max(1, len(frames))),
             "yaw_mean": float(np.mean(yaw_vals)) if yaw_vals else 0.0,
-            "blink_estimate": float(blink_count_est)
+            "blink_estimate": float(blink_count_est),
         }
-        # merge with keyboard/mouse
-        input_feats = self.activity_tracker.sample_window(self.window_seconds)
-        feats.update(input_feats)
+        feats.update(self.activity_tracker.sample_window(self.window_seconds))
         feats["ts_end"] = time.time()
         feats["ts_start"] = feats["ts_end"] - self.window_seconds
         return feats
 
     def run(self):
-        # Keep frames buffer of recent frames (timestamped)
         while not self.stop_event.is_set():
-            # drain incoming frames
             try:
                 while True:
                     item = self.frame_queue.get_nowait()
                     self.buffer.append(item)
-                    # prune old frames
                     cutoff = time.time() - self.window_seconds - 1.0
                     while self.buffer and self.buffer[0][1] < cutoff:
                         self.buffer.popleft()
@@ -266,10 +247,8 @@ class WindowAggregator(threading.Thread):
 
             now = time.time()
             if now - self.last_emit >= self.step_seconds:
-                # create frames list for window
                 cutoff = now - self.window_seconds
                 frames = [f for f in list(self.buffer) if f[1] >= cutoff]
-                # if we have few frames, you may still process — heuristics will handle missing face
                 feats = self.extract_window_features(frames)
                 try:
                     self.output_queue.put_nowait(feats)
@@ -279,14 +258,16 @@ class WindowAggregator(threading.Thread):
             time.sleep(0.05)
 
 # -----------------------------
-# Classifier wrapper
+# Classifier
 # -----------------------------
 class FocusClassifier:
     def __init__(self, model_path=MODEL_PATH):
         self.model_path = model_path
         self.model = None
-        self.feature_order = ["ear_mean", "ear_std", "face_presence", "blink_estimate",
-                              "keystrokes", "mouse_moves", "clicks", "idle_seconds"]
+        self.feature_order = [
+            "ear_mean", "ear_std", "face_presence", "blink_estimate",
+            "keystrokes", "mouse_moves", "clicks", "idle_seconds"
+        ]
         self.load_model()
 
     def load_model(self):
@@ -301,55 +282,46 @@ class FocusClassifier:
             joblib.dump(self.model, self.model_path)
 
     def predict_proba(self, feats):
-        # If model exists, use it; else use heuristic rules
         X = np.array([feats.get(k, 0.0) for k in self.feature_order]).reshape(1, -1)
         if self.model is not None:
             try:
-                p = self.model.predict_proba(X)[0][1]  # probability of "Distracted"
-                return float(p)
+                return float(self.model.predict_proba(X)[0][1])
             except Exception:
                 pass
-        # Heuristic fallback:
-        # Distracted if face missing most of window OR idle long + low input OR ear mean very low
+        # Heuristic fallback
         distracted_score = 0.0
-        # face presence
-        fp = feats.get("face_presence", 0.0)
+        fp, ear = feats.get("face_presence", 0.0), feats.get("ear_mean", 1.0)
+        idle, ks = feats.get("idle_seconds", 0.0), feats.get("keystrokes", 0)
         if fp < 0.5:
             distracted_score += 0.6 * (1 - fp)
-        # EAR
-        ear = feats.get("ear_mean", 1.0)
         if ear < 0.14:
             distracted_score += 0.3
-        # idle & keystrokes
-        idle = feats.get("idle_seconds", 0.0)
-        ks = feats.get("keystrokes", 0)
         if idle > 10 and ks == 0:
             distracted_score += 0.4
-        # clamp
-        p = max(0.0, min(1.0, distracted_score))
-        return float(p)
+        return float(max(0.0, min(1.0, distracted_score)))
 
     def train_from_csv(self, csv_path=LABEL_CSV):
         if not os.path.exists(csv_path):
             raise FileNotFoundError("Label CSV not found.")
         df = pd.read_csv(csv_path)
-        # ensure necessary features present
         for col in self.feature_order:
             if col not in df.columns:
                 df[col] = 0.0
         X = df[self.feature_order].values
         y = df["label"].map({"Focused": 0, "Distracted": 1}).values
-        X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, stratify=y, test_size=0.2, random_state=42
+        )
         clf = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
         clf.fit(X_train, y_train)
-        preds = clf.predict(X_test)
-        report = classification_report(y_test, preds, target_names=["Focused", "Distracted"])
+        report = classification_report(y_test, clf.predict(X_test),
+                                       target_names=["Focused", "Distracted"])
         self.model = clf
         self.save_model()
         return report
 
 # -----------------------------
-# Persistence helpers (labels)
+# Persistence
 # -----------------------------
 def append_label_row(feats, label, csv_path=LABEL_CSV):
     header = ["ts_start", "ts_end", "ear_mean", "ear_std", "face_presence", "blink_estimate",
@@ -359,20 +331,14 @@ def append_label_row(feats, label, csv_path=LABEL_CSV):
         writer = csv.writer(f)
         if write_header:
             writer.writerow(header)
-        row = [
-            feats.get("ts_start", 0.0),
-            feats.get("ts_end", 0.0),
-            feats.get("ear_mean", 0.0),
-            feats.get("ear_std", 0.0),
-            feats.get("face_presence", 0.0),
-            feats.get("blink_estimate", 0.0),
-            feats.get("keystrokes", 0),
-            feats.get("mouse_moves", 0),
-            feats.get("clicks", 0),
-            feats.get("idle_seconds", 0.0),
+        writer.writerow([
+            feats.get("ts_start", 0.0), feats.get("ts_end", 0.0),
+            feats.get("ear_mean", 0.0), feats.get("ear_std", 0.0),
+            feats.get("face_presence", 0.0), feats.get("blink_estimate", 0.0),
+            feats.get("keystrokes", 0), feats.get("mouse_moves", 0),
+            feats.get("clicks", 0), feats.get("idle_seconds", 0.0),
             label
-        ]
-        writer.writerow(row)
+        ])
 
 # -----------------------------
 # Streamlit App
@@ -381,20 +347,18 @@ def main():
     st.set_page_config(page_title="Personalized Study Timer", layout="wide")
     st.title("Personalized Study Timer — Local MVP")
 
-    # Sidebar controls
+    # Sidebar
     with st.sidebar:
         st.header("Settings")
         window_seconds = st.number_input("Window length (sec)", value=WINDOW_SECONDS, min_value=2, max_value=15, step=1)
         step_seconds = st.number_input("Step (sec)", value=STEP_SECONDS, min_value=1, max_value=window_seconds, step=1)
-        ear_thresh = st.slider("EAR blink threshold (for heuristics)", min_value=0.05, max_value=0.4, value=EAR_BLINK_THRESHOLD, step=0.01)
         capture_inputs = st.checkbox("Capture global keyboard & mouse", value=True)
         enable_notifications = st.checkbox("Enable desktop notifications", value=True)
         st.markdown("---")
-        st.write("Model")
         if os.path.exists(MODEL_PATH):
             st.success(f"Model found at {MODEL_PATH}")
         else:
-            st.info("No trained model found. Will use heuristic classifier until you train.")
+            st.info("No trained model found. Using heuristic classifier.")
         if st.button("Delete saved model"):
             try:
                 os.remove(MODEL_PATH)
@@ -402,17 +366,19 @@ def main():
             except Exception as e:
                 st.error(f"Error deleting model: {e}")
 
-    # Session state initialization
+    # Init session state
     if "initialized" not in st.session_state:
         st.session_state.initialized = True
         st.session_state.stop_event = threading.Event()
         st.session_state.frame_queue = queue.Queue(maxsize=200)
         st.session_state.feature_queue = queue.Queue(maxsize=200)
         st.session_state.activity_tracker = ActivityTracker()
-        st.session_state.webcam_thread = WebcamCapture(st.session_state.frame_queue, st.session_state.stop_event, fps=FPS_TARGET)
-        st.session_state.aggregator = WindowAggregator(st.session_state.frame_queue, st.session_state.activity_tracker,
-                                                       st.session_state.feature_queue, st.session_state.stop_event,
-                                                       window_seconds=window_seconds, step_seconds=step_seconds)
+        st.session_state.webcam_thread = WebcamCapture(st.session_state.frame_queue, st.session_state.stop_event)
+        st.session_state.aggregator = WindowAggregator(
+            st.session_state.frame_queue, st.session_state.activity_tracker,
+            st.session_state.feature_queue, st.session_state.stop_event,
+            window_seconds=window_seconds, step_seconds=step_seconds
+        )
         st.session_state.classifier = FocusClassifier()
         st.session_state.recent_probs = collections.deque(maxlen=300)
         st.session_state.recent_feats = collections.deque(maxlen=300)
@@ -422,37 +388,36 @@ def main():
         st.session_state.break_seconds = 5 * 60
         st.session_state.smooth_prob = 0.0
 
-    # Apply GUI settings to threads where possible
     st.session_state.aggregator.window_seconds = window_seconds
     st.session_state.aggregator.step_seconds = step_seconds
 
-    # Start/Stop capture buttons
+    # Controls
     col_control = st.columns([3, 1])[0]
     with col_control:
         start_capture = st.button("Start capture")
         stop_capture = st.button("Stop capture")
     if start_capture:
-        # start listeners and threads
         st.session_state.stop_event.clear()
         if capture_inputs:
             st.session_state.activity_tracker.start()
-        # start webcam thread if not alive
         if not st.session_state.webcam_thread.is_alive():
-            st.session_state.webcam_thread = WebcamCapture(st.session_state.frame_queue, st.session_state.stop_event, fps=FPS_TARGET)
+            st.session_state.webcam_thread = WebcamCapture(st.session_state.frame_queue, st.session_state.stop_event)
             st.session_state.webcam_thread.start()
         if not st.session_state.aggregator.is_alive():
-            st.session_state.aggregator = WindowAggregator(st.session_state.frame_queue, st.session_state.activity_tracker,
-                                                           st.session_state.feature_queue, st.session_state.stop_event,
-                                                           window_seconds=window_seconds, step_seconds=step_seconds)
+            st.session_state.aggregator = WindowAggregator(
+                st.session_state.frame_queue, st.session_state.activity_tracker,
+                st.session_state.feature_queue, st.session_state.stop_event,
+                window_seconds=window_seconds, step_seconds=step_seconds
+            )
             st.session_state.aggregator.start()
-        st.success("Capture started (webcam + inputs).")
+        st.success("Capture started.")
 
     if stop_capture:
         st.session_state.stop_event.set()
         st.session_state.activity_tracker.stop()
         st.success("Stopped capture.")
 
-    # Live status & controls
+    # UI Layout
     left, right = st.columns([2, 1])
     with left:
         st.subheader("Live distraction status")
@@ -472,7 +437,7 @@ def main():
             st.session_state.session_end_time = None
             st.info("Pomodoro stopped.")
 
-    # Labeling / training controls
+    # Labeling & Training
     st.markdown("---")
     st.subheader("Labeling & model")
     label_col1, label_col2, label_col3 = st.columns([1,1,2])
@@ -493,114 +458,47 @@ def main():
             except Exception:
                 st.error("No recent window to label.")
     with label_col3:
-        if st.button("Train RandomForest from labels"):
+        if st.button("Train model from CSV"):
             try:
-                report = st.session_state.classifier.train_from_csv(LABEL_CSV)
-                st.success("Model trained & saved.")
-                st.text("Evaluation on hold-out test set:")
-                st.text(report)
-                st.session_state.classifier.load_model()
+                report = st.session_state.classifier.train_from_csv()
+                st.code(report)
+                st.success("Model trained and saved.")
             except Exception as e:
-                st.error(f"Training failed: {e}")
+                st.error(str(e))
 
-    st.markdown("---")
-    st.write("Recent labeled data file:", LABEL_CSV, " — exists:" , os.path.exists(LABEL_CSV))
-
-    # Main loop: poll feature_queue and update UI
-    prob_series = []
-    timestamps = []
-    last_notify_time = 0
-    notify_cooldown = 60  # secs between notifications
-
-    # provide a placeholder for the loop to run in Streamlit without blocking
-    placeholder = st.empty()
-    # run a short loop that reads a few windows to update the page (Streamlit will re-run on user interaction)
-    iter_count = 0
-    while iter_count < 20:
-        iter_count += 1
-        try:
-            feats = st.session_state.feature_queue.get(timeout=0.5)
-            # record recent feats
+    # Poll feature queue
+    try:
+        while True:
+            feats = st.session_state.feature_queue.get_nowait()
+            prob = st.session_state.classifier.predict_proba(feats)
+            st.session_state.smooth_prob = 0.7 * st.session_state.smooth_prob + 0.3 * prob
+            st.session_state.recent_probs.append((feats["ts_end"], st.session_state.smooth_prob))
             st.session_state.recent_feats.append(feats)
-            # predict
-            p = st.session_state.classifier.predict_proba(feats)
-            # smooth prob (EMA)
-            alpha = 0.35
-            st.session_state.smooth_prob = alpha * p + (1 - alpha) * st.session_state.smooth_prob
-            st.session_state.recent_probs.append(st.session_state.smooth_prob)
-            # UI updates
-            prob_series = list(st.session_state.recent_probs)
-            timestamps = list(range(len(prob_series)))
-            prob_chart.line_chart(pd.DataFrame({"distracted_prob": prob_series}))
-            # status text
-            status_text = f"Distracted probability: {st.session_state.smooth_prob:.2f}"
-            if st.session_state.smooth_prob < 0.25:
-                status_box.success(f"Status: Focused — {status_text}")
-            elif st.session_state.smooth_prob < 0.6:
-                status_box.info(f"Status: Neutral — {status_text}")
-            else:
-                status_box.error(f"Status: Distracted — {status_text}")
-                # send notification if enabled and cooldown passed and pomodoro is running
-                if enable_notifications and PLYER_AVAILABLE and (time.time() - last_notify_time > notify_cooldown):
-                    try:
-                        notification.notify(title="Study Timer: Distracted detected",
-                                            message="You appear distracted. Consider a short break or refocus.",
-                                            timeout=5)
-                        last_notify_time = time.time()
-                    except Exception:
-                        pass
-            # show last features (small)
-            last_feats_box.json({
-                "ear_mean": round(feats.get("ear_mean", 0.0), 3),
-                "face_presence": round(feats.get("face_presence", 0.3), 3),
-                "keystrokes": int(feats.get("keystrokes", 0)),
-                "mouse_moves": int(feats.get("mouse_moves", 0)),
-                "idle_sec": round(feats.get("idle_seconds", 0.0), 1),
-            })
-            # Pomodoro logic: if running and distracted sustained beyond threshold, optionally pause or notify user
-            if st.session_state.timer_running and st.session_state.session_end_time:
-                remaining = int(st.session_state.session_end_time - time.time())
-                if remaining <= 0:
-                    # switch between focus and break
-                    if st.session_state.timer_running:
-                        # simple cycle: if in focus -> break; if in break -> focus
-                        if "on_break" not in st.session_state or not st.session_state.on_break:
-                            st.session_state.on_break = True
-                            st.session_state.session_end_time = time.time() + st.session_state.break_seconds
-                            st.success("Focus period ended. Break started.")
-                            if enable_notifications and PLYER_AVAILABLE:
-                                try:
-                                    notification.notify(title="Focus complete", message="Time for a break!", timeout=5)
-                                except Exception:
-                                    pass
-                        else:
-                            st.session_state.on_break = False
-                            st.session_state.session_end_time = time.time() + st.session_state.focus_seconds
-                            st.success("Break ended. Focus started.")
-                            if enable_notifications and PLYER_AVAILABLE:
-                                try:
-                                    notification.notify(title="Break over", message="Back to focus!", timeout=5)
-                                except Exception:
-                                    pass
-                else:
-                    mins = remaining // 60
-                    secs = remaining % 60
-                    st.info(f"Time remaining: {mins:02d}:{secs:02d}")
-            # small sleep to avoid hot-looping
-            time.sleep(0.05)
-        except queue.Empty:
-            # no new window - show whatever we have
-            if len(st.session_state.recent_probs) > 0:
-                prob_chart.line_chart(pd.DataFrame({"distracted_prob": list(st.session_state.recent_probs)}))
-            else:
-                prob_chart.text("Waiting for data...")
-            time.sleep(0.2)
-        # re-evaluate whether capture is running; if not, break loop to avoid busy wait
-        if st.session_state.stop_event.is_set():
-            break
+    except queue.Empty:
+        pass
 
-    placeholder.empty()
-    st.write("App idle. Press 'Start capture' to begin or interact with controls. Refresh page to restart components.")
+    # Update UI
+    if st.session_state.recent_probs:
+        last_ts, prob = st.session_state.recent_probs[-1]
+        status = "Distracted" if prob > 0.5 else "Focused"
+        status_color = "red" if status == "Distracted" else "green"
+        status_box.markdown(f"<h2 style='color:{status_color};'>Status: {status} ({prob:.2f})</h2>", unsafe_allow_html=True)
+        df_chart = pd.DataFrame(st.session_state.recent_probs, columns=["ts", "prob"])
+        df_chart["time"] = pd.to_datetime(df_chart["ts"], unit="s")
+        prob_chart.line_chart(df_chart.set_index("time")["prob"])
+        last_feats_box.json(st.session_state.recent_feats[-1])
+        if enable_notifications and PLYER_AVAILABLE and status == "Distracted":
+            notification.notify(title="Study Timer Alert", message="You seem distracted!", timeout=3)
+
+    if st.session_state.timer_running and st.session_state.session_end_time:
+        remaining = max(0, int(st.session_state.session_end_time - time.time()))
+        mins, secs = divmod(remaining, 60)
+        st.sidebar.markdown(f"⏳ **Time left:** {mins:02d}:{secs:02d}")
+        if remaining <= 0:
+            st.session_state.timer_running = False
+            st.sidebar.success("Session complete! Take a break.")
+            if enable_notifications and PLYER_AVAILABLE:
+                notification.notify(title="Pomodoro Complete", message="Time for a break!", timeout=5)
 
 if __name__ == "__main__":
     main()
